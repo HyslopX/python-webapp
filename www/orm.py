@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+__author__ = 'Michael Liao'
+
 import asyncio, logging
 
 import aiomysql
@@ -7,11 +10,11 @@ import aiomysql
 def log(sql, args=()):
     logging.info('SQL: %s' % sql)
 
-#创建数据库连接池
-async def create_pool(loop, **kw):
+@asyncio.coroutine
+def create_pool(loop, **kw):
     logging.info('create database connection pool...')
     global __pool
-    __pool = await aiomysql.create_pool(
+    __pool = yield from aiomysql.create_pool(
         host=kw.get('host', 'localhost'),
         port=kw.get('port', 3306),
         user=kw['user'],
@@ -23,79 +26,47 @@ async def create_pool(loop, **kw):
         minsize=kw.get('minsize', 1),
         loop=loop
     )
-    
-async def close_pool():
-    logging.info('close database connection pool...')
-    global __pool
-    if __pool is not None:
-        __pool.close()
-        await __pool.wait_closed()
-#封装select方法 传入SQL语句和SQL参数：
-    '''
-    数据库查询函数
-    :param sql: sql语句
-    :param args: sql语句中的参数
-    :param size: 要查询的数量
-    :return: 查询结果
-    '''
-async def select(sql, args, size=None):
+
+@asyncio.coroutine
+def select(sql, args, size=None):
     log(sql, args)
     global __pool
-    async with __pool.get() as conn:
-    	 # 创建一个结果为字典的游标 ?
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-        	# 执行sql语句，将sql语句中的'?'替换成'%s'
-            await cur.execute(sql.replace('?', '%s'), args or ())
-             # 如果指定了数量，就返回指定数量的记录，如果没有，就返回所有记录
-            if size:
-                rs = await cur.fetchmany(size)
-            else:
-                rs = await cur.fetchall()
+    with (yield from __pool) as conn:
+        cur = yield from conn.cursor(aiomysql.DictCursor)
+        yield from cur.execute(sql.replace('?', '%s'), args or ())
+        if size:
+            rs = yield from cur.fetchmany(size)
+        else:
+            rs = yield from cur.fetchall()
+        yield from cur.close()
         logging.info('rows returned: %s' % len(rs))
         return rs
 
-#除了select方法要返回查询内容，
-#剩下的update,insert,delete均只需返回一个影响行数，所以可将它们三个封装为一个execute方法
-    '''
-    Insert、Update、Delete操作的公共执行函数
-    :param sql:sql语句
-    :param args:sql参数
-    :param autocommit:自动提交事务
-    :return:
-    '''
-async def execute(sql, args, autocommit=True):
+@asyncio.coroutine
+def execute(sql, args, autocommit=True):
     log(sql)
-    async with __pool.get() as conn:
+    with (yield from __pool) as conn:
         if not autocommit:
-            await conn.begin()
+            yield from conn.begin()
         try:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
-            	 # 执行sql语句
-                await cur.execute(sql.replace('?', '%s'), args)
-                 # 获取操作的记录数
-                affected = cur.rowcount
+            cur = yield from conn.cursor()
+            yield from cur.execute(sql.replace('?', '%s'), args)
+            affected = cur.rowcount
+            yield from cur.close()
             if not autocommit:
-                await conn.commit()
+                yield from conn.commit()
         except BaseException as e:
             if not autocommit:
-                await conn.rollback()
+                yield from conn.rollback()
             raise
-        finally:
-            conn.close()
         return affected
 
-def create_args_string(num):   
-    '''
-    用来计算需要拼接多少个占位符
-    :param num:
-    :return:
-    '''
+def create_args_string(num):
     L = []
     for n in range(num):
         L.append('?')
     return ', '.join(L)
 
-#字段类的实现
 class Field(object):
 
     def __init__(self, name, column_type, primary_key, default):
@@ -106,7 +77,7 @@ class Field(object):
 
     def __str__(self):
         return '<%s, %s:%s>' % (self.__class__.__name__, self.column_type, self.name)
-#映射varchar的StringField
+
 class StringField(Field):
 
     def __init__(self, name=None, primary_key=False, default=None, ddl='varchar(100)'):
@@ -131,26 +102,14 @@ class TextField(Field):
 
     def __init__(self, name=None, default=None):
         super().__init__(name, 'text', False, default)
-#注意到Model只是一个基类，如何将具体的子类如User的映射信息读取出来呢？答案就是通过metaclass：ModelMetaclass
-#这样，任何继承自Model的类（比如User），会自动通过ModelMetaclass扫描映射关系，
-#并存储到自身的类属性如__table__、__mappings__中。
+
 class ModelMetaclass(type):
 
     def __new__(cls, name, bases, attrs):
-        '''
-        创建模型与表映射的基类
-        :param name:类名
-        :param bases:父类
-        :param attrs:类的属性列表
-        :return:模型元类
-        '''
-        # 排除Model类本身
         if name=='Model':
             return type.__new__(cls, name, bases, attrs)
-        # 获取表名，如果没有表名则将类名作为表名
         tableName = attrs.get('__table__', None) or name
         logging.info('found model: %s (table: %s)' % (name, tableName))
-         # 获取所有的类属性和主键名:
         mappings = dict()
         fields = []
         primaryKey = None
@@ -170,7 +129,6 @@ class ModelMetaclass(type):
         for k in mappings.keys():
             attrs.pop(k)
         escaped_fields = list(map(lambda f: '`%s`' % f, fields))
-
         attrs['__mappings__'] = mappings # 保存属性和列的映射关系
         attrs['__table__'] = tableName
         attrs['__primary_key__'] = primaryKey # 主键属性名
@@ -180,7 +138,7 @@ class ModelMetaclass(type):
         attrs['__update__'] = 'update `%s` set %s where `%s`=?' % (tableName, ', '.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
         attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (tableName, primaryKey)
         return type.__new__(cls, name, bases, attrs)
-#model类
+
 class Model(dict, metaclass=ModelMetaclass):
 
     def __init__(self, **kw):
@@ -207,9 +165,10 @@ class Model(dict, metaclass=ModelMetaclass):
                 logging.debug('using default value for %s: %s' % (key, str(value)))
                 setattr(self, key, value)
         return value
-	#然后，我们往Model类添加class方法，就可以让所有子类调用class方法：
+
     @classmethod
-    async def findAll(cls, where=None, args=None, **kw):
+    @asyncio.coroutine
+    def findAll(cls, where=None, args=None, **kw):
         ' find objects by where clause. '
         sql = [cls.__select__]
         if where:
@@ -232,46 +191,50 @@ class Model(dict, metaclass=ModelMetaclass):
                 args.extend(limit)
             else:
                 raise ValueError('Invalid limit value: %s' % str(limit))
-        rs = await select(' '.join(sql), args)
+        rs = yield from select(' '.join(sql), args)
         return [cls(**r) for r in rs]
 
     @classmethod
-    async def findNumber(cls, selectField, where=None, args=None):
+    @asyncio.coroutine
+    def findNumber(cls, selectField, where=None, args=None):
         ' find number by select and where. '
         sql = ['select %s _num_ from `%s`' % (selectField, cls.__table__)]
         if where:
             sql.append('where')
             sql.append(where)
-        rs = await select(' '.join(sql), args, 1)
+        rs = yield from select(' '.join(sql), args, 1)
         if len(rs) == 0:
             return None
         return rs[0]['_num_']
 
     @classmethod
-    async def find(cls, pk):
+    @asyncio.coroutine
+    def find(cls, pk):
         ' find object by primary key. '
-        rs = await select('%s where `%s`=?' % (cls.__select__, cls.__primary_key__), [pk], 1)
+        rs = yield from select('%s where `%s`=?' % (cls.__select__, cls.__primary_key__), [pk], 1)
         if len(rs) == 0:
             return None
         return cls(**rs[0])
 
-    async def save(self):
+    @asyncio.coroutine
+    def save(self):
         args = list(map(self.getValueOrDefault, self.__fields__))
         args.append(self.getValueOrDefault(self.__primary_key__))
-        rows = await execute(self.__insert__, args)
+        rows = yield from execute(self.__insert__, args)
         if rows != 1:
             logging.warn('failed to insert record: affected rows: %s' % rows)
 
-    async def update(self):
+    @asyncio.coroutine
+    def update(self):
         args = list(map(self.getValue, self.__fields__))
         args.append(self.getValue(self.__primary_key__))
-        rows = await execute(self.__update__, args)
+        rows = yield from execute(self.__update__, args)
         if rows != 1:
             logging.warn('failed to update by primary key: affected rows: %s' % rows)
 
-    async def remove(self):
+    @asyncio.coroutine
+    def remove(self):
         args = [self.getValue(self.__primary_key__)]
-        rows = await execute(self.__delete__, args)
+        rows = yield from execute(self.__delete__, args)
         if rows != 1:
             logging.warn('failed to remove by primary key: affected rows: %s' % rows)
-

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+#默认的配置文件
 '''
 Default configurations.
 '''
